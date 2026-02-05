@@ -50,7 +50,9 @@ class PokeDatCLI:
         logger.info("  pokedat.exe <command> <input> [output] --version=<version> [--format=<format>]\n")
         logger.info("Commands:")
         logger.info("  read       <file or folder> [output_folder]  -  Extracts texts")
-        logger.info("  write      <input_file or folder> <output_folder>  -  Generates .dat files\n")
+        logger.info("  write      <input_file or folder> <output_folder>  -  Generates .dat files")
+        logger.info("  merge      <folder> [output_file]  -  Merges all .dat files from subfolders into single .txt files")
+        logger.info("  split      <merged_txt_folder> <output_folder>  -  Splits merged .txt back into .dat files\n")
         logger.info("Supported versions: LGPE, SWSH, LA, SV, LZA")
         logger.info("Supported formats: json, txt\n")
     
@@ -59,8 +61,8 @@ class PokeDatCLI:
         """Parse and validate command line arguments."""
         parser = argparse.ArgumentParser(
             description="PokeDAT Switch | by Steins;Traduções",
-            usage="pokedat.py {read,write} input [output] --version={LGPE,SWSH,LA,SV,LZA} [--format={json,txt}] [-h]\n")
-        parser.add_argument("command", choices=["read", "write"], help="Command to execute")
+            usage="pokedat.py {read,write,merge,split} input [output] --version={LGPE,SWSH,LA,SV,LZA} [--format={json,txt}] [-h]\n")
+        parser.add_argument("command", choices=["read", "write", "merge", "split"], help="Command to execute")
         parser.add_argument("input", help="Input file or folder")
         parser.add_argument("output", nargs="?", help="Output folder (optional for 'read')")
         parser.add_argument("--version", required=True, choices=["LGPE", "SWSH", "LA", "SV", "LZA"],
@@ -360,6 +362,241 @@ class DatWriter:
         logger.info("="*60 + "\n")
 
 
+class DatMerger:
+    """Handles merging multiple .dat files into a single text file per folder."""
+    
+    def __init__(self, config: TextConfig):
+        self.config = config
+        self.separator = "~" * 50
+    
+    def merge_folder(self, folder_path: str, output_file: str) -> None:
+        """Merge all .dat files from a folder into a single text file."""
+        if not os.path.isdir(folder_path):
+            logger.error(f"Folder not found: {folder_path}")
+            return
+        
+        dat_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.dat')])
+        
+        if not dat_files:
+            logger.warning(f"No .dat files found in {folder_path}")
+            return
+        
+        logger.info(f"Merging {len(dat_files)} files from {os.path.basename(folder_path)}...")
+        
+        try:
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            with open(output_file, 'w', encoding='utf-8') as out_f:
+                for idx, dat_file in enumerate(dat_files, 1):
+                    dat_path = os.path.join(folder_path, dat_file)
+                    
+                    # Read .dat file
+                    try:
+                        with open(dat_path, 'rb') as f:
+                            data = f.read()
+                        lines = get_strings(data, self.config)
+                        
+                        if lines is None:
+                            logger.warning(f"Could not extract strings from {dat_file}")
+                            continue
+                        
+                        # Write separator and filename
+                        out_f.write(f"{dat_file} {self.separator}\n")
+                        
+                        # Write all lines
+                        for line in lines:
+                            out_f.write(f"{line}\n")
+                        
+                        # Add blank line between files (except last)
+                        if idx < len(dat_files):
+                            out_f.write("\n")
+                        
+                        logger.info(f"  [{idx}/{len(dat_files)}] Merged: {dat_file}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing {dat_file}: {e}")
+                        continue
+            
+            logger.info(f"✓ Merged file created: {output_file}\n")
+            
+        except Exception as e:
+            logger.error(f"Error creating merged file {output_file}: {e}")
+    
+    def process_directory(self, input_folder: str, output_folder: Optional[str] = None) -> None:
+        """Process all subfolders and create merged text files."""
+        if not os.path.isdir(input_folder):
+            logger.error(f"Input folder not found: {input_folder}")
+            sys.exit(1)
+        
+        # Find all subfolders
+        subfolders = [f for f in os.listdir(input_folder) 
+                     if os.path.isdir(os.path.join(input_folder, f))]
+        
+        if not subfolders:
+            logger.warning(f"No subfolders found in {input_folder}")
+            return
+        
+        # Set output folder
+        if output_folder is None:
+            output_folder = input_folder
+        
+        logger.info(f"Found {len(subfolders)} folder(s): {', '.join(subfolders)}\n")
+        
+        for subfolder in subfolders:
+            folder_path = os.path.join(input_folder, subfolder)
+            output_file = os.path.join(output_folder, f"{subfolder}.txt")
+            self.merge_folder(folder_path, output_file)
+
+
+class DatSplitter:
+    """Handles splitting merged text files back into individual .dat files."""
+    
+    def __init__(self, config: TextConfig):
+        self.config = config
+        self.separator_prefix = "~" * 50
+        self.original_line_counts = {}
+    
+    def split_file(self, merged_txt: str, output_folder: str) -> None:
+        """Split a merged text file back into individual .dat files."""
+        if not os.path.isfile(merged_txt):
+            logger.error(f"File not found: {merged_txt}")
+            return
+        
+        try:
+            with open(merged_txt, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            logger.error(f"Error reading {merged_txt}: {e}")
+            return
+        
+        # Determine subfolder name from filename (e.g., "common.txt" -> "common")
+        base_name = os.path.basename(merged_txt)
+        subfolder_name = os.path.splitext(base_name)[0]
+        
+        output_subfolder = os.path.join(output_folder, subfolder_name)
+        os.makedirs(output_subfolder, exist_ok=True)
+        
+        # Split content by separator
+        files_data = {}
+        current_file = None
+        current_lines = []
+        
+        for line in content.split('\n'):
+            # Check if line is a separator (ends with ~~~)
+            if self.separator_prefix in line and line.endswith(self.separator_prefix):
+                # Save previous file if exists
+                if current_file and current_lines:
+                    files_data[current_file] = current_lines
+                
+                # Extract filename from separator line (format: "filename.dat ~~~")
+                parts = line.split(self.separator_prefix)
+                if len(parts) > 0:
+                    current_file = parts[0].strip()
+                    current_lines = []
+            elif current_file is not None:
+                # Add line to current file (skip empty separator lines)
+                if line or current_lines:  # Keep line if it's not empty or if we already have content
+                    current_lines.append(line)
+        
+        # Save last file
+        if current_file and current_lines:
+            # Remove trailing empty lines
+            while current_lines and not current_lines[-1]:
+                current_lines.pop()
+            files_data[current_file] = current_lines
+        
+        if not files_data:
+            logger.warning(f"No data found in {merged_txt}")
+            return
+        
+        logger.info(f"Splitting {len(files_data)} files to {subfolder_name}/...\n")
+        
+        success_count = 0
+        error_count = 0
+        warnings = []
+        
+        # Create .dat files
+        for idx, (filename, lines) in enumerate(sorted(files_data.items()), 1):
+            try:
+                # Remove empty strings from end
+                while lines and not lines[-1]:
+                    lines.pop()
+                
+                if not lines:
+                    logger.warning(f"  [{idx}/{len(files_data)}] Skipping {filename} (no content)")
+                    continue
+                
+                # Check if original file exists to compare line count
+                original_file = os.path.join(os.path.dirname(merged_txt).replace(os.path.basename(os.path.dirname(merged_txt)), subfolder_name), filename)
+                if os.path.exists(original_file):
+                    try:
+                        with open(original_file, 'rb') as f:
+                            original_data = f.read()
+                        original_lines = get_strings(original_data, self.config)
+                        if original_lines and len(lines) < len(original_lines):
+                            diff = len(original_lines) - len(lines)
+                            warning_msg = f"{filename}: FALTANDO {diff} linha(s) (original: {len(original_lines)}, atual: {len(lines)})"
+                            warnings.append(warning_msg)
+                            logger.warning(f"  ⚠ {warning_msg}")
+                    except:
+                        pass  # If cannot read original, just continue
+                
+                # Generate .dat file
+                flags = [0] * len(lines)
+                data = get_bytes(lines, flags, self.config)
+                
+                output_path = os.path.join(output_subfolder, filename)
+                with open(output_path, 'wb') as f:
+                    f.write(data)
+                
+                logger.info(f"  [{idx}/{len(files_data)}] ✓ Created: {filename}")
+                success_count += 1
+                
+            except Exception as e:
+                logger.error(f"  [{idx}/{len(files_data)}] ✗ Error creating {filename}: {e}")
+                error_count += 1
+        
+        logger.info(f"\n✓ Split complete: {success_count} files created")
+        if error_count > 0:
+            logger.error(f"✗ Errors: {error_count}")
+        if warnings:
+            logger.warning(f"\n⚠ AVISOS: {len(warnings)} arquivo(s) com linhas faltando:")
+            for warning in warnings:
+                logger.warning(f"  - {warning}")
+        logger.info("")
+    
+    def process_directory(self, input_folder: str, output_folder: str) -> None:
+        """Process all merged text files in a folder."""
+        if not os.path.isdir(input_folder):
+            logger.error(f"Input folder not found: {input_folder}")
+            sys.exit(1)
+        
+        # Find all .txt files that could be merged files
+        all_txt_files = [f for f in os.listdir(input_folder) if f.endswith('.txt')]
+        
+        # Filter to only include files that match expected folder names (common, script, sk, etc)
+        merged_files = []
+        for txt_file in all_txt_files:
+            base_name = os.path.splitext(txt_file)[0]
+            # Check if a folder with this name might contain .dat files
+            potential_folder = os.path.join(input_folder, base_name)
+            if os.path.isdir(potential_folder) or base_name in ['common', 'script', 'sk']:
+                merged_files.append(txt_file)
+        
+        # If no specific folders found, just use all .txt files
+        if not merged_files:
+            merged_files = all_txt_files
+        
+        if not merged_files:
+            logger.warning(f"No .txt files found in {input_folder}")
+            return
+        
+        logger.info(f"Found {len(merged_files)} merged file(s)\n")
+        
+        for merged_file in sorted(merged_files):
+            file_path = os.path.join(input_folder, merged_file)
+            self.split_file(file_path, output_folder)
+
+
 def run_read(args: argparse.Namespace, config: TextConfig) -> None:
     reader = DatReader(config)
     read_format_map = {
@@ -395,6 +632,28 @@ def run_write(args: argparse.Namespace, config: TextConfig) -> None:
         process_func(args.input, input_root, args.output)
 
 
+def run_merge(args: argparse.Namespace, config: TextConfig) -> None:
+    """Merge all .dat files from subfolders into single text files."""
+    merger = DatMerger(config)
+    merger.process_directory(args.input, args.output)
+
+
+def run_split(args: argparse.Namespace, config: TextConfig) -> None:
+    """Split merged text files back into individual .dat files."""
+    if not args.output:
+        logger.error("Missing output path for 'split' command.")
+        sys.exit(1)
+    
+    splitter = DatSplitter(config)
+    
+    if os.path.isfile(args.input):
+        # Single file
+        splitter.split_file(args.input, args.output)
+    else:
+        # Directory with multiple merged files
+        splitter.process_directory(args.input, args.output)
+
+
 def main() -> None:
     """Main entry point for the application."""
     args = PokeDatCLI.parse_args()
@@ -404,6 +663,10 @@ def main() -> None:
         run_read(args, config)
     elif args.command == "write":
         run_write(args, config)
+    elif args.command == "merge":
+        run_merge(args, config)
+    elif args.command == "split":
+        run_split(args, config)
 
 
 if __name__ == "__main__":
